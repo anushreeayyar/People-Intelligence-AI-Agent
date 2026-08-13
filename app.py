@@ -25,11 +25,38 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-if not config.WAREHOUSE.exists():
-    st.error(
-        "**Warehouse not found.** Generate the synthetic dataset first:\n\n"
-        "```bash\npython data/generate_data.py\n```"
+@st.cache_resource(show_spinner=False)
+def ensure_warehouse() -> str:
+    """Build the synthetic warehouse on first run if it is not already present.
+
+    The .duckdb file is deliberately not committed - a binary database does not
+    belong in version control - so a fresh deployment has no warehouse until one
+    is generated. Rather than failing with an instruction the deployed app can't
+    follow, it builds its own. Cached as a resource so this happens once per
+    container, not once per session.
+    """
+    if config.WAREHOUSE.exists():
+        return "present"
+    import subprocess
+    generator = Path(__file__).resolve().parent / "data" / "generate_data.py"
+    result = subprocess.run(
+        [sys.executable, str(generator)],
+        capture_output=True, text=True, timeout=600,
     )
+    if result.returncode != 0 or not config.WAREHOUSE.exists():
+        raise RuntimeError(result.stderr[-2000:] or "Generator produced no warehouse.")
+    return "built"
+
+
+try:
+    with st.spinner("First run: building the synthetic warehouse. About fifteen seconds."):
+        warehouse_state = ensure_warehouse()
+except Exception as exc:                                       # noqa: BLE001
+    st.error(
+        "**Could not build the synthetic warehouse.** Run it locally with "
+        "`python data/generate_data.py` and check the output below."
+    )
+    st.code(str(exc), language="text")
     st.stop()
 
 css()
