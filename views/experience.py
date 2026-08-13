@@ -148,6 +148,6 @@ with tab3:
         st.warning(
             "This is an association, not a cause. Respondents who are already "
             "disengaged may be more likely to comment at all, which inflates the gap "
-            "for every theme.", icon="⚠")
+            "for every theme.", icon=":material/warning:")
         ui.explain_panel(link, "ex_link")
         ui.download(link.data, "theme-engagement-link.csv", key="ex_dl")

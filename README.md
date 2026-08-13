@@ -3,7 +3,7 @@
 ### ▶ [Open the live app](https://people-intelligence-ai-agent.streamlit.app)
 
 [![Live app](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://people-intelligence-ai-agent.streamlit.app)
-![Tests](https://img.shields.io/badge/tests-223%20passing-2a7f62)
+![Tests](https://img.shields.io/badge/tests-230%20passing-2a7f62)
 ![Metrics](https://img.shields.io/badge/metric%20dictionary-22%20metrics-1f4e79)
 ![Data](https://img.shields.io/badge/data-100%25%20synthetic-6b7280)
 
@@ -153,7 +153,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ```bash
 make data     # regenerate the warehouse
 make run      # launch the app
-make test     # 223 tests
+make test     # 230 tests
 make brief    # print today's daily brief as Markdown
 ```
 
@@ -340,12 +340,12 @@ python automation/run_daily_brief.py --webhook "$SLACK_WEBHOOK_URL"
 make test
 ```
 
-**223 tests**, and they test the claims rather than the plumbing.
+**230 tests**, and they test the claims rather than the plumbing.
 
 - `test_governance.py` — row policy per role, cross-unit denial, filter intersection, aggregation thresholds, SQL-injection through filter values, twelve categories of hostile SQL, ad-hoc SQL denied to non-analyst roles, eight sensitive-question refusals asserting *zero tool calls executed*, prompt-injection blocking, identifier redaction, audit completeness.
 - `test_metrics.py` — every metric fully documented; every metric executes on every dimension it declares; reconciliation (unit sums equal the total, trend's last month equals the point-in-time count, voluntary never exceeds total attrition); bounds (engagement 1–5, eNPS ±100, conversions 0–100%); funnel monotonicity; determinism; every seeded defect detected *and* zero surviving into governed views.
 - `test_intent_routing.py` — 25 question-to-metric routing assertions, dimension detection, filter extraction, scenario parsing, then every sample question end-to-end asserting a grounded answer backed by successful tool calls and SQL provenance — plus that an HRBP's answer never mentions another unit.
-- `test_app_pages.py` — all six pages render for all four roles via Streamlit's `AppTest`.
+- `test_app_pages.py` — all six pages render for all four roles via Streamlit's `AppTest`, *and* the Ask page renders a completed conversation with its charts, evidence tabs and data frames. That second case exists because a live deployment once failed on a code path the empty page never reaches; a static check now validates every Streamlit icon argument in the repo for the same reason.
 
 ---
 
@@ -375,7 +375,7 @@ people-intelligence/
 ├── automation/
 │   ├── run_daily_brief.py       # headless runner (cron / CI / n8n)
 │   └── n8n_workflow.json        # importable workflow with a quality gate
-└── tests/                       # 223 tests
+└── tests/                       # 230 tests
 ```
 
 ---
@@ -411,7 +411,7 @@ what produces the numbers.
 
 The application is deployed and running at
 **[people-intelligence-ai-agent.streamlit.app](https://people-intelligence-ai-agent.streamlit.app)** — six pages,
-a governed agent, 223 passing tests and a data-quality gate wired into CI.
+a governed agent, 230 passing tests and a data-quality gate wired into CI.
 
 It runs on synthetic data by design — `data/generate_data.py` builds the warehouse, so anyone can clone the repo and have a working People Intelligence product in about fifteen seconds without an HR data agreement. That is a deliberate architectural choice, not a limitation. The generator sits behind the same governed views everything else reads, so pointing this at a real HRIS and ATS means replacing one ingestion module: land `employees`, `requisitions`, `candidates`, `survey_responses` and `internal_moves` from Workday, Greenhouse or equivalent, and the semantic layer, role policy, quality checks, agent tools and dashboards all work unchanged.
 

@@ -156,7 +156,7 @@ def scope_notice(ctx: AccessContext) -> None:
             f"Viewing as **{ctx.role.label} — {ctx.persona}**. Every figure on this "
             f"page is restricted to {', '.join(units)} by the row policy, and groups "
             f"smaller than {ctx.role.min_group_size} are suppressed.",
-            icon="🔒",
+            icon=":material/lock:",
         )
 
 

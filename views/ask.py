@@ -102,7 +102,7 @@ for turn in st.session_state.chat:
                                 + (f", {p['suppressed_groups']} group(s) suppressed"
                                    if p["suppressed_groups"] else ""))
                     st.markdown(f"- Access policy: {p['row_policy']}")
-                st.info(ev["data_quality"], icon="✓")
+                st.info(ev["data_quality"], icon=":material/verified:")
             with t3:
                 if ev["sql"]:
                     for s in ev["sql"]:
