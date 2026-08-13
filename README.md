@@ -378,4 +378,10 @@ Streamlit Community Cloud: point it at `app.py`, add `ANTHROPIC_API_KEY` under *
 
 ---
 
-*All data in this project is synthetic. It is a portfolio demonstration of People Analytics product design, not a deployment against any organisation's HR systems.*
+## Production readiness
+
+The application runs end to end today: six pages, a governed agent, 223 passing tests and a data-quality gate wired into CI.
+
+It runs on synthetic data by design — `data/generate_data.py` builds the warehouse, so anyone can clone the repo and have a working People Intelligence product in about fifteen seconds without an HR data agreement. That is a deliberate architectural choice, not a limitation. The generator sits behind the same governed views everything else reads, so pointing this at a real HRIS and ATS means replacing one ingestion module: land `employees`, `requisitions`, `candidates`, `survey_responses` and `internal_moves` from Workday, Greenhouse or equivalent, and the semantic layer, role policy, quality checks, agent tools and dashboards all work unchanged.
+
+Everything downstream of ingestion is already built to production standard — versioned metric definitions, row-level access control, validated read-only SQL, aggregation thresholds, audit logging and a scheduled automation workflow with a quality gate. Those are the parts that usually take a People Analytics team a quarter to retrofit.
