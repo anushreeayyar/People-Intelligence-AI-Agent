@@ -1,5 +1,12 @@
 # People Intelligence
 
+### ▶ [Open the live app](https://people-intelligence-ai-agent.streamlit.app)
+
+[![Live app](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://people-intelligence-ai-agent.streamlit.app)
+![Tests](https://img.shields.io/badge/tests-223%20passing-2a7f62)
+![Metrics](https://img.shields.io/badge/metric%20dictionary-22%20metrics-1f4e79)
+![Data](https://img.shields.io/badge/data-100%25%20synthetic-6b7280)
+
 **An AI-native People Analytics product: natural-language workforce analysis over a governed metric layer, where the model chooses the question and the semantic layer computes the answer.**
 
 An HRBP asks *"which business units have the highest voluntary attrition?"* in plain language. The agent classifies the intent, selects the standard metric from a versioned dictionary, executes validated SQL against governed views, analyses the result, renders a chart, and explains the finding — with the definition, the source system, the filters, the access policy, the data-quality position and the exact query attached to every answer.
@@ -109,10 +116,25 @@ Five raw tables become eight governed views. Nothing in the product reads a raw 
 
 ---
 
+## Try it
+
+**[people-intelligence-ai-agent.streamlit.app](https://people-intelligence-ai-agent.streamlit.app)** — no setup, no account.
+
+A five-minute tour that shows what the product actually does:
+
+1. **Executive Overview** — read the Daily Brief. Six signals, each with why it matters and what to do next.
+2. **Ask People Intelligence** — click *"Where are candidates dropping out of the funnel?"*, then open **Explain my answer** and look at the *Query executed* tab. That is the SQL that produced the number in the sentence above it.
+3. **Sidebar → Role** — switch from HR Business Partner to HR Leader. Every figure on every page changes, because the row policy is enforced in the semantic layer rather than the UI. Switch to Executive and the department-level breakdowns disappear entirely.
+4. **Ask** — type *"Give me the salary of employee 10483"*. It is refused before any query runs, and the refusal is written to the audit log.
+5. **Data & Governance** — paste hostile SQL into the validator and watch it get rejected, then read the audit log for everything you just did.
+
+---
+
 ## Quickstart
 
 ```bash
-git clone <this-repo> && cd people-intelligence
+git clone https://github.com/anushreeayyar/People-Intelligence-AI-Agent.git
+cd People-Intelligence-AI-Agent
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -360,7 +382,14 @@ people-intelligence/
 
 ## Deploying
 
-Streamlit Community Cloud: point it at `app.py`, add `ANTHROPIC_API_KEY` under **Secrets** if you want the model in the loop, and add a pre-run step or commit-time hook that executes `python data/generate_data.py` — the warehouse is gitignored on purpose, because a binary database file does not belong in version control.
+Deployed on Streamlit Community Cloud from `main`, entry point `app.py`. The warehouse is gitignored on
+purpose — a binary database file does not belong in version control — so `app.py` builds it on first run
+and caches it for the life of the container. A fresh clone or a fresh deployment therefore needs no data
+step at all.
+
+To put Claude in the loop rather than the deterministic router, add `ANTHROPIC_API_KEY` under **Settings →
+Secrets**. The live demo runs without one deliberately: it shows that the governed layer, not the model, is
+what produces the numbers.
 
 ---
 
@@ -380,7 +409,9 @@ Streamlit Community Cloud: point it at `app.py`, add `ANTHROPIC_API_KEY` under *
 
 ## Production readiness
 
-The application runs end to end today: six pages, a governed agent, 223 passing tests and a data-quality gate wired into CI.
+The application is deployed and running at
+**[people-intelligence-ai-agent.streamlit.app](https://people-intelligence-ai-agent.streamlit.app)** — six pages,
+a governed agent, 223 passing tests and a data-quality gate wired into CI.
 
 It runs on synthetic data by design — `data/generate_data.py` builds the warehouse, so anyone can clone the repo and have a working People Intelligence product in about fifteen seconds without an HR data agreement. That is a deliberate architectural choice, not a limitation. The generator sits behind the same governed views everything else reads, so pointing this at a real HRIS and ATS means replacing one ingestion module: land `employees`, `requisitions`, `candidates`, `survey_responses` and `internal_moves` from Workday, Greenhouse or equivalent, and the semantic layer, role policy, quality checks, agent tools and dashboards all work unchanged.
 
