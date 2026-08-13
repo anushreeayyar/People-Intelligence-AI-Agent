@@ -1,0 +1,14 @@
+# Core application
+streamlit>=1.40
+duckdb>=1.1
+pandas>=2.1
+numpy>=1.26
+plotly>=5.22
+PyYAML>=6.0
+
+# AI agent (optional at runtime - the app falls back to the deterministic
+# router when no ANTHROPIC_API_KEY is present)
+anthropic>=0.40
+
+# Tests
+pytest>=8.0

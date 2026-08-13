@@ -1,0 +1,23 @@
+# Data artefacts - regenerate with `python data/generate_data.py`
+data/warehouse.duckdb
+data/warehouse.duckdb.wal
+data/audit_log.jsonl
+data/briefs/
+
+# Environment
+.env
+.venv/
+venv/
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,795 @@
+# ============================================================================
+# People Metrics Dictionary  -  the semantic layer
+# ----------------------------------------------------------------------------
+# This file is the single source of truth for what a People metric MEANS.
+# Nothing in the product - not the dashboards, not the daily brief, not the
+# AI agent - is allowed to invent its own arithmetic. Every number rendered
+# anywhere in this application is produced by executing one of the SQL
+# definitions below against the governed views in the warehouse.
+#
+# Placeholders resolved at runtime by pi/semantic_layer.py:
+#   {dimension}     a whitelisted grouping column, or the literal 'All'
+#   {filters}       AND-prefixed predicates derived from validated filters
+#                   plus the caller's role-based row policy
+#
+# Owner column reflects the accountable data steward, as it would in a real
+# People Analytics team.
+# ============================================================================
+
+version: "1.4.0"
+as_of_date: "2026-06-30"
+
+dimensions:
+  business_unit:   {label: "Business Unit",  tables: [employees, requisitions, candidates, survey_responses]}
+  department:      {label: "Department",     tables: [employees, requisitions, candidates, survey_responses]}
+  job_family:      {label: "Job Family",     tables: [employees, requisitions, candidates, survey_responses]}
+  job_level:       {label: "Job Level",      tables: [employees, requisitions, candidates, survey_responses]}
+  location:        {label: "Location",       tables: [employees, survey_responses]}
+  tenure_band:     {label: "Tenure Band",    tables: [employees, survey_responses]}
+  source:          {label: "Recruiting Source", tables: [candidates]}
+  theme:           {label: "Feedback Theme", tables: [survey_responses]}
+  work_model:      {label: "Work Model",     tables: [employees]}
+
+metrics:
+
+  # ------------------------------------------------------------- WORKFORCE
+  headcount:
+    label: Headcount
+    domain: Workforce
+    definition: >
+      Count of employees with an active employment status as at the reporting
+      date. An employee is active if they have a hire date on or before the
+      reporting date and no termination date, or a termination date after the
+      reporting date. Contingent workers and contractors are out of scope.
+    formula: "COUNT(DISTINCT employee_id) WHERE is_active"
+    source_system: HRIS
+    source_objects: [v_employees]
+    grain: employee
+    unit: count
+    format: "{:,.0f}"
+    direction: context
+    owner: People Analytics
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Excludes records quarantined by the employee data-quality rules.
+      - Point-in-time count; does not equal average headcount used in rate metrics.
+    dimensions: [business_unit, department, job_family, job_level, location, tenure_band, work_model]
+    sql: |
+      SELECT {dimension} AS dimension,
+             COUNT(DISTINCT employee_id) AS value
+      FROM v_employees
+      WHERE is_active {filters}
+      GROUP BY 1
+      ORDER BY value DESC
+
+  headcount_trend:
+    label: Headcount Trend
+    domain: Workforce
+    definition: >
+      Active headcount measured at each calendar month end over the trailing
+      24 months, from the employee-month fact.
+    formula: "COUNT(DISTINCT employee_id) per month_end"
+    source_system: HRIS
+    source_objects: [v_headcount_monthly]
+    grain: employee-month
+    unit: count
+    format: "{:,.0f}"
+    direction: context
+    owner: People Analytics
+    refresh: Daily 06:00 UTC
+    caveats:
+      - The final month may be partial if the reporting date is mid-month.
+    dimensions: [business_unit, department, job_family, job_level, location, tenure_band]
+    sql: |
+      SELECT month_end AS period,
+             {dimension} AS dimension,
+             COUNT(DISTINCT employee_id) AS value
+      FROM v_headcount_monthly
+      WHERE 1=1 {filters}
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+
+  headcount_growth_rate:
+    label: Headcount Growth Rate (YoY)
+    domain: Workforce
+    definition: >
+      Percentage change in active headcount between the reporting month end
+      and the same month end twelve months earlier.
+    formula: "(headcount_now - headcount_12m_ago) / headcount_12m_ago"
+    source_system: HRIS
+    source_objects: [v_headcount_monthly]
+    grain: month
+    unit: percent
+    format: "{:+.1f}%"
+    direction: context
+    owner: Workforce Planning
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Reorganisations that move populations between units distort unit-level growth.
+    dimensions: [business_unit, department, job_family, job_level]
+    sql: |
+      WITH bounds AS (
+        SELECT MAX(month_end) AS m_now FROM v_headcount_monthly
+      ),
+      now_hc AS (
+        SELECT {dimension} AS dimension, COUNT(DISTINCT employee_id) AS hc
+        FROM v_headcount_monthly, bounds
+        WHERE month_end = bounds.m_now {filters}
+        GROUP BY 1
+      ),
+      prior_hc AS (
+        SELECT {dimension} AS dimension, COUNT(DISTINCT employee_id) AS hc
+        FROM v_headcount_monthly, bounds
+        WHERE month_end = (SELECT MAX(month_end) FROM v_headcount_monthly
+                           WHERE month_end <= bounds.m_now - INTERVAL 12 MONTH) {filters}
+        GROUP BY 1
+      )
+      SELECT n.dimension,
+             ROUND(100.0 * (n.hc - p.hc) / NULLIF(p.hc, 0), 1) AS value,
+             n.hc AS headcount_now,
+             p.hc AS headcount_prior
+      FROM now_hc n JOIN prior_hc p USING (dimension)
+      ORDER BY value DESC
+
+  # ------------------------------------------------------------- RETENTION
+  voluntary_attrition_rate:
+    label: Voluntary Attrition Rate
+    domain: Retention
+    definition: >
+      Voluntary exits in the trailing twelve months divided by average active
+      headcount over the same period, expressed as a percentage. A voluntary
+      exit is an employee-initiated termination; redundancies, performance
+      exits and end-of-contract are excluded and counted as involuntary.
+      This is the enterprise standard attrition definition - if a stakeholder
+      says "attrition" without qualification, this is the metric.
+    formula: "voluntary_exits_T12M / average_monthly_headcount_T12M"
+    source_system: HRIS
+    source_objects: [v_employees, v_headcount_monthly]
+    grain: employee
+    unit: percent
+    format: "{:.1f}%"
+    direction: lower_is_better
+    benchmark: 12.0
+    owner: People Analytics
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Average headcount is the mean of the trailing 13 month-end snapshots.
+      - Groups smaller than the aggregation threshold are suppressed.
+      - 42 terminated records carry no termination date and are quarantined.
+    dimensions: [business_unit, department, job_family, job_level, location, tenure_band, work_model]
+    sql: |
+      WITH ref AS (SELECT MAX(month_end) AS m FROM v_headcount_monthly),
+      exits AS (
+        SELECT {dimension} AS dimension, COUNT(*) AS vol_exits
+        FROM v_employees, ref
+        WHERE termination_type = 'Voluntary'
+          AND termination_date > ref.m - INTERVAL 12 MONTH
+          AND termination_date <= ref.m {filters}
+        GROUP BY 1
+      ),
+      avg_hc AS (
+        SELECT dimension, AVG(hc) AS avg_headcount FROM (
+          SELECT month_end, {dimension} AS dimension, COUNT(DISTINCT employee_id) AS hc
+          FROM v_headcount_monthly, ref
+          WHERE month_end > ref.m - INTERVAL 12 MONTH {filters}
+          GROUP BY 1, 2
+        ) GROUP BY 1
+      )
+      SELECT a.dimension,
+             ROUND(100.0 * COALESCE(e.vol_exits, 0) / NULLIF(a.avg_headcount, 0), 1) AS value,
+             COALESCE(e.vol_exits, 0) AS voluntary_exits,
+             ROUND(a.avg_headcount, 0) AS avg_headcount
+      FROM avg_hc a LEFT JOIN exits e USING (dimension)
+      WHERE a.avg_headcount >= 5
+      ORDER BY value DESC
+
+  total_attrition_rate:
+    label: Total Attrition Rate
+    domain: Retention
+    definition: >
+      All exits, voluntary and involuntary, in the trailing twelve months
+      divided by average active headcount over the same period.
+    formula: "all_exits_T12M / average_monthly_headcount_T12M"
+    source_system: HRIS
+    source_objects: [v_employees, v_headcount_monthly]
+    grain: employee
+    unit: percent
+    format: "{:.1f}%"
+    direction: lower_is_better
+    owner: People Analytics
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Includes restructure-driven exits, which are a leadership decision rather than a retention failure.
+    dimensions: [business_unit, department, job_family, job_level, location, tenure_band]
+    sql: |
+      WITH ref AS (SELECT MAX(month_end) AS m FROM v_headcount_monthly),
+      exits AS (
+        SELECT {dimension} AS dimension, COUNT(*) AS all_exits
+        FROM v_employees, ref
+        WHERE termination_date IS NOT NULL
+          AND termination_date > ref.m - INTERVAL 12 MONTH
+          AND termination_date <= ref.m {filters}
+        GROUP BY 1
+      ),
+      avg_hc AS (
+        SELECT dimension, AVG(hc) AS avg_headcount FROM (
+          SELECT month_end, {dimension} AS dimension, COUNT(DISTINCT employee_id) AS hc
+          FROM v_headcount_monthly, ref
+          WHERE month_end > ref.m - INTERVAL 12 MONTH {filters}
+          GROUP BY 1, 2
+        ) GROUP BY 1
+      )
+      SELECT a.dimension,
+             ROUND(100.0 * COALESCE(e.all_exits, 0) / NULLIF(a.avg_headcount, 0), 1) AS value,
+             COALESCE(e.all_exits, 0) AS exits,
+             ROUND(a.avg_headcount, 0) AS avg_headcount
+      FROM avg_hc a LEFT JOIN exits e USING (dimension)
+      WHERE a.avg_headcount >= 5
+      ORDER BY value DESC
+
+  attrition_trend:
+    label: Attrition Trend (rolling 12m)
+    domain: Retention
+    definition: >
+      Voluntary attrition rate recalculated at every month end on a rolling
+      twelve month basis, so that month-to-month movement reflects a genuine
+      change in run rate rather than seasonal noise in a single month.
+    formula: "rolling_12m_voluntary_exits / rolling_12m_average_headcount, per month"
+    source_system: HRIS
+    source_objects: [v_employees, v_headcount_monthly]
+    grain: month
+    unit: percent
+    format: "{:.1f}%"
+    direction: lower_is_better
+    owner: People Analytics
+    refresh: Daily 06:00 UTC
+    caveats:
+      - The first eleven months of the window are omitted; a rolling year needs a full year behind it.
+    dimensions: [business_unit, department, job_family, job_level]
+    sql: |
+      WITH months AS (SELECT DISTINCT month_end FROM v_headcount_monthly),
+      hc AS (
+        SELECT month_end, {dimension} AS dimension, COUNT(DISTINCT employee_id) AS hc
+        FROM v_headcount_monthly WHERE 1=1 {filters} GROUP BY 1, 2
+      ),
+      ex AS (
+        SELECT (DATE_TRUNC('month', termination_date) + INTERVAL 1 MONTH - INTERVAL 1 DAY)::DATE AS month_end,
+               {dimension} AS dimension, COUNT(*) AS vol_exits
+        FROM v_employees
+        WHERE termination_type = 'Voluntary' {filters}
+        GROUP BY 1, 2
+      ),
+      joined AS (
+        SELECT h.month_end, h.dimension, h.hc, COALESCE(e.vol_exits, 0) AS vol_exits
+        FROM hc h LEFT JOIN ex e USING (month_end, dimension)
+      )
+      SELECT month_end AS period, dimension,
+             ROUND(100.0 * SUM(vol_exits) OVER w / NULLIF(AVG(hc) OVER w, 0), 1) AS value
+      FROM joined
+      WINDOW w AS (PARTITION BY dimension ORDER BY month_end ROWS BETWEEN 11 PRECEDING AND CURRENT ROW)
+      QUALIFY month_end >= (SELECT MIN(month_end) FROM months) + INTERVAL 11 MONTH
+      ORDER BY period, dimension
+
+  exit_reason_mix:
+    label: Exit Reason Mix
+    domain: Retention
+    definition: >
+      Distribution of stated voluntary exit reasons over the trailing twelve
+      months. Reasons are captured at exit interview and are self-reported.
+    formula: "exits_by_reason / total_voluntary_exits"
+    source_system: HRIS
+    source_objects: [v_employees]
+    grain: employee
+    unit: percent
+    format: "{:.1f}%"
+    direction: context
+    owner: People Analytics
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Self-reported and known to under-report manager-related reasons.
+    dimensions: [business_unit, department, job_level, tenure_band]
+    sql: |
+      WITH ref AS (SELECT MAX(month_end) AS m FROM v_headcount_monthly)
+      SELECT termination_reason AS dimension,
+             COUNT(*) AS exits,
+             ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS value
+      FROM v_employees, ref
+      WHERE termination_type = 'Voluntary'
+        AND termination_date > ref.m - INTERVAL 12 MONTH {filters}
+      GROUP BY 1
+      ORDER BY exits DESC
+
+  internal_mobility_rate:
+    label: Internal Mobility Rate
+    domain: Retention
+    definition: >
+      Internal moves (promotion, lateral or cross-unit transfer) completed in
+      the trailing twelve months divided by average active headcount. A healthy
+      internal market is one of the strongest structural protections against
+      voluntary attrition.
+    formula: "internal_moves_T12M / average_headcount_T12M"
+    source_system: HRIS
+    source_objects: [v_internal_moves, v_headcount_monthly]
+    grain: move
+    unit: percent
+    format: "{:.1f}%"
+    direction: higher_is_better
+    benchmark: 12.0
+    owner: Talent Management
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Counts moves, not people; one employee may move twice in a year.
+    dimensions: [business_unit, job_level]
+    sql: |
+      WITH ref AS (SELECT MAX(month_end) AS m FROM v_headcount_monthly),
+      moves AS (
+        SELECT m.from_business_unit AS business_unit, m.from_job_level AS job_level,
+               COUNT(*) AS n
+        FROM v_internal_moves m, ref
+        WHERE m.move_date > ref.m - INTERVAL 12 MONTH
+        GROUP BY 1, 2
+      ),
+      hc AS (
+        SELECT business_unit, job_level, AVG(hc) AS avg_headcount FROM (
+          SELECT month_end, business_unit, job_level, COUNT(DISTINCT employee_id) AS hc
+          FROM v_headcount_monthly, ref
+          WHERE month_end > ref.m - INTERVAL 12 MONTH {filters}
+          GROUP BY 1, 2, 3
+        ) GROUP BY 1, 2
+      ),
+      comb AS (
+        SELECT h.business_unit, h.job_level, h.avg_headcount, COALESCE(m.n, 0) AS moves
+        FROM hc h LEFT JOIN moves m
+          ON h.business_unit = m.business_unit AND h.job_level = m.job_level
+      )
+      SELECT {dimension} AS dimension,
+             ROUND(100.0 * SUM(moves) / NULLIF(SUM(avg_headcount), 0), 1) AS value,
+             SUM(moves) AS internal_moves,
+             ROUND(SUM(avg_headcount), 0) AS avg_headcount
+      FROM comb
+      GROUP BY 1
+      ORDER BY value DESC
+
+  retention_risk_index:
+    label: Retention Risk Index
+    domain: Retention
+    definition: >
+      A composite 0-100 score that ranks employee groups by how likely they are
+      to need retention attention next. It blends four standardised inputs -
+      current voluntary attrition rate (40%), the change in that rate versus the
+      prior year (25%), engagement score inverted (20%), and workload score
+      inverted (15%). It is a prioritisation aid for HRBPs, not a prediction
+      about any individual, and is never computed below the aggregation threshold.
+    formula: "40*z(attrition) + 25*z(attrition_delta) + 20*z(-engagement) + 15*z(-workload), rescaled 0-100"
+    source_system: Derived (HRIS + Engagement)
+    source_objects: [v_employees, v_headcount_monthly, v_survey]
+    grain: group
+    unit: index
+    format: "{:.0f}"
+    direction: lower_is_better
+    owner: People Analytics
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Composite index, not a probability. Do not present as "% likely to leave".
+      - Individual-level scoring is deliberately not implemented.
+      - Groups below the minimum size are suppressed entirely.
+    dimensions: [business_unit, department, job_level, job_family, tenure_band]
+    computed_by: pi.semantic_layer.retention_risk_index
+
+  # ------------------------------------------------------------ RECRUITING
+  time_to_fill:
+    label: Time to Fill
+    domain: Recruiting
+    definition: >
+      Median and mean calendar days from requisition open date to accepted
+      offer date, for requisitions filled in the period. Days are calendar
+      days, not business days. Requisitions exceeding 365 days are treated as
+      data-quality outliers and excluded.
+    formula: "offer_accepted_date - requisition_opened_date, for filled reqs"
+    source_system: ATS
+    source_objects: [v_requisitions]
+    grain: requisition
+    unit: days
+    format: "{:.0f} days"
+    direction: lower_is_better
+    benchmark: 45
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Survivorship bias - measures filled reqs only, so a unit that cannot fill roles can look fast.
+      - Read alongside requisition ageing, which captures the unfilled tail.
+      - 9 requisitions excluded as outliers over 365 days.
+    dimensions: [business_unit, department, job_family, job_level]
+    sql: |
+      WITH ref AS (SELECT MAX(month_end) AS m FROM v_headcount_monthly)
+      SELECT {dimension} AS dimension,
+             ROUND(MEDIAN(time_to_fill_days), 0) AS value,
+             ROUND(AVG(time_to_fill_days), 1) AS mean_days,
+             COUNT(*) AS filled_requisitions
+      FROM v_requisitions, ref
+      WHERE status = 'Filled'
+        AND NOT is_ttf_outlier
+        AND offer_accepted_date > ref.m - INTERVAL 12 MONTH {filters}
+      GROUP BY 1
+      HAVING COUNT(*) >= 5
+      ORDER BY value DESC
+
+  time_to_fill_trend:
+    label: Time to Fill Trend
+    domain: Recruiting
+    definition: >
+      Median time to fill by quarter of offer acceptance, showing whether the
+      hiring machine is speeding up or slowing down.
+    formula: "median(time_to_fill_days) grouped by acceptance quarter"
+    source_system: ATS
+    source_objects: [v_requisitions]
+    grain: requisition
+    unit: days
+    format: "{:.0f} days"
+    direction: lower_is_better
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Small units produce volatile quarterly medians; check the requisition count.
+    dimensions: [business_unit, job_family, job_level]
+    sql: |
+      SELECT DATE_TRUNC('quarter', offer_accepted_date)::DATE AS period,
+             {dimension} AS dimension,
+             ROUND(MEDIAN(time_to_fill_days), 0) AS value,
+             COUNT(*) AS filled_requisitions
+      FROM v_requisitions
+      WHERE status = 'Filled' AND NOT is_ttf_outlier {filters}
+      GROUP BY 1, 2
+      HAVING COUNT(*) >= 3
+      ORDER BY 1, 2
+
+  open_requisitions:
+    label: Open Requisitions
+    domain: Recruiting
+    definition: >
+      Requisitions in Open or On Hold status as at the reporting date, with the
+      count flagged as business critical shown alongside.
+    formula: "COUNT(requisition_id) WHERE status IN ('Open','On Hold')"
+    source_system: ATS
+    source_objects: [v_requisitions]
+    grain: requisition
+    unit: count
+    format: "{:,.0f}"
+    direction: context
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - On Hold requisitions are included; they still represent unmet demand.
+    dimensions: [business_unit, department, job_family, job_level]
+    sql: |
+      SELECT {dimension} AS dimension,
+             COUNT(*) AS value,
+             COUNT(*) FILTER (WHERE is_critical) AS critical_requisitions,
+             ROUND(AVG(req_age_days), 0) AS avg_age_days,
+             COUNT(*) FILTER (WHERE req_age_days > 90) AS aged_over_90d
+      FROM v_requisitions
+      WHERE status IN ('Open', 'On Hold') {filters}
+      GROUP BY 1
+      ORDER BY value DESC
+
+  requisition_aging:
+    label: Requisition Ageing
+    domain: Recruiting
+    definition: >
+      Distribution of currently open requisitions across age buckets measured
+      from requisition open date. The over-90-day bucket is the operational
+      escalation trigger for Talent Acquisition.
+    formula: "COUNT(open reqs) bucketed by days since opened"
+    source_system: ATS
+    source_objects: [v_requisitions]
+    grain: requisition
+    unit: count
+    format: "{:,.0f}"
+    direction: lower_is_better
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Reopened requisitions retain their original open date.
+    dimensions: [business_unit, job_family, job_level]
+    sql: |
+      SELECT {dimension} AS dimension,
+             CASE WHEN req_age_days <= 30 THEN '0-30d'
+                  WHEN req_age_days <= 60 THEN '31-60d'
+                  WHEN req_age_days <= 90 THEN '61-90d'
+                  ELSE '90d+' END AS age_bucket,
+             COUNT(*) AS value
+      FROM v_requisitions
+      WHERE status IN ('Open', 'On Hold') {filters}
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+
+  funnel_conversion:
+    label: Recruiting Funnel Conversion
+    domain: Recruiting
+    definition: >
+      Candidate volume reaching each stage of the hiring process, with both
+      stage-to-stage conversion and cumulative pass-through from application.
+      Stages are Applied, Recruiter Screen, Hiring Manager Screen, Onsite
+      Interview, Offer Extended, Offer Accepted.
+    formula: "candidates_at_stage_n / candidates_at_stage_n-1"
+    source_system: ATS
+    source_objects: [v_candidates]
+    grain: candidate
+    unit: count
+    format: "{:,.0f}"
+    direction: higher_is_better
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Candidates still in process are counted at their current furthest stage.
+      - 17 duplicate applications are de-duplicated by candidate id.
+    dimensions: [business_unit, department, job_family, job_level, source]
+    sql: |
+      WITH stages(stage_index, stage_name) AS (
+        VALUES (0,'Applied'), (1,'Recruiter Screen'), (2,'Hiring Manager Screen'),
+               (3,'Onsite Interview'), (4,'Offer Extended'), (5,'Offer Accepted')
+      ),
+      reached AS (
+        SELECT s.stage_index, s.stage_name, COUNT(c.candidate_id) AS candidates
+        FROM stages s
+        LEFT JOIN v_candidates c ON c.stage_index >= s.stage_index {filters}
+        GROUP BY 1, 2
+      )
+      SELECT stage_name AS dimension, stage_index, candidates AS value,
+             ROUND(100.0 * candidates /
+                   NULLIF(LAG(candidates) OVER (ORDER BY stage_index), 0), 1) AS step_conversion_pct,
+             ROUND(100.0 * candidates /
+                   NULLIF(FIRST_VALUE(candidates) OVER (ORDER BY stage_index), 0), 2) AS cumulative_pct
+      FROM reached
+      ORDER BY stage_index
+
+  source_effectiveness:
+    label: Source Effectiveness
+    domain: Recruiting
+    definition: >
+      For each recruiting source, the volume of applications and the percentage
+      that convert all the way to an accepted offer. Measures quality of intake,
+      not volume of intake - a high-volume source with low conversion consumes
+      recruiter capacity without producing hires.
+    formula: "accepted_offers_from_source / applications_from_source"
+    source_system: ATS
+    source_objects: [v_candidates]
+    grain: candidate
+    unit: percent
+    format: "{:.2f}%"
+    direction: higher_is_better
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Referral and internal sources are pre-filtered by definition, so higher conversion is expected.
+      - Does not account for cost per hire or downstream quality of hire.
+    dimensions: [business_unit, department, job_family, job_level]
+    sql: |
+      SELECT source AS dimension,
+             COUNT(*) AS applications,
+             COUNT(*) FILTER (WHERE stage_index >= 4) AS offers,
+             COUNT(*) FILTER (WHERE stage_index >= 5) AS hires,
+             ROUND(100.0 * COUNT(*) FILTER (WHERE stage_index >= 5) / NULLIF(COUNT(*), 0), 2) AS value
+      FROM v_candidates
+      WHERE 1=1 {filters}
+      GROUP BY 1
+      HAVING COUNT(*) >= 20
+      ORDER BY value DESC
+
+  offer_acceptance_rate:
+    label: Offer Acceptance Rate
+    domain: Recruiting
+    definition: >
+      Offers accepted divided by offers extended. A falling acceptance rate is
+      usually a signal about compensation competitiveness, candidate experience,
+      or speed of the closing process.
+    formula: "offers_accepted / offers_extended"
+    source_system: ATS
+    source_objects: [v_candidates]
+    grain: candidate
+    unit: percent
+    format: "{:.1f}%"
+    direction: higher_is_better
+    benchmark: 85.0
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Offers still awaiting a candidate decision are excluded from the denominator.
+    dimensions: [business_unit, department, job_family, job_level, source]
+    sql: |
+      SELECT {dimension} AS dimension,
+             COUNT(*) AS offers_decided,
+             COUNT(*) FILTER (WHERE offer_status = 'Accepted') AS offers_accepted,
+             ROUND(100.0 * COUNT(*) FILTER (WHERE offer_status = 'Accepted')
+                   / NULLIF(COUNT(*), 0), 1) AS value
+      FROM v_candidates
+      WHERE offer_status IN ('Accepted', 'Declined') {filters}
+      GROUP BY 1
+      HAVING COUNT(*) >= 5
+      ORDER BY value DESC
+
+  hires:
+    label: Hires
+    domain: Recruiting
+    definition: >
+      External hires with a start date in the trailing twelve months. Internal
+      moves are excluded and reported under internal mobility.
+    formula: "COUNT(employee_id) WHERE hire_date in period"
+    source_system: HRIS
+    source_objects: [v_employees]
+    grain: employee
+    unit: count
+    format: "{:,.0f}"
+    direction: context
+    owner: Talent Acquisition
+    refresh: Daily 06:00 UTC
+    caveats:
+      - Rehires of former employees are counted as new hires.
+    dimensions: [business_unit, department, job_family, job_level, location]
+    sql: |
+      WITH ref AS (SELECT MAX(month_end) AS m FROM v_headcount_monthly)
+      SELECT {dimension} AS dimension, COUNT(*) AS value
+      FROM v_employees, ref
+      WHERE hire_date > ref.m - INTERVAL 12 MONTH
+        AND hire_date <= ref.m {filters}
+      GROUP BY 1
+      ORDER BY value DESC
+
+  # --------------------------------------------------- EMPLOYEE EXPERIENCE
+  engagement_score:
+    label: Engagement Score
+    domain: Employee Experience
+    definition: >
+      Mean response to the core engagement item on the quarterly listening
+      survey, on a one to five scale. Reported only where a group has at least
+      the minimum number of responses, to protect respondent confidentiality.
+    formula: "AVG(engagement_score) over responses in period"
+    source_system: Engagement Platform
+    source_objects: [v_survey]
+    grain: survey response
+    unit: score
+    format: "{:.2f}"
+    direction: higher_is_better
+    benchmark: 3.80
+    owner: Employee Listening
+    refresh: Quarterly, on survey close
+    caveats:
+      - Response rate is roughly one third of active employees; non-response bias is possible.
+      - 64 responses with a missing score are excluded.
+      - Suppressed below the minimum group size.
+    dimensions: [business_unit, department, job_family, job_level, location, tenure_band]
+    sql: |
+      SELECT {dimension} AS dimension,
+             ROUND(AVG(engagement_score), 2) AS value,
+             COUNT(*) AS responses,
+             ROUND(AVG(manager_score), 2) AS manager_score,
+             ROUND(AVG(workload_score), 2) AS workload_score,
+             ROUND(AVG(growth_score), 2) AS growth_score
+      FROM v_survey
+      WHERE survey_period = (SELECT MAX(survey_period) FROM v_survey) {filters}
+      GROUP BY 1
+      HAVING COUNT(*) >= 5
+      ORDER BY value ASC
+
+  engagement_trend:
+    label: Engagement Trend
+    domain: Employee Experience
+    definition: >
+      Mean engagement score by survey period over the trailing eight quarters.
+    formula: "AVG(engagement_score) per survey_period"
+    source_system: Engagement Platform
+    source_objects: [v_survey]
+    grain: survey response
+    unit: score
+    format: "{:.2f}"
+    direction: higher_is_better
+    owner: Employee Listening
+    refresh: Quarterly, on survey close
+    caveats:
+      - Survey item wording has been stable across all eight periods.
+    dimensions: [business_unit, department, job_level, tenure_band]
+    sql: |
+      SELECT survey_period AS period,
+             {dimension} AS dimension,
+             ROUND(AVG(engagement_score), 2) AS value,
+             COUNT(*) AS responses
+      FROM v_survey
+      WHERE 1=1 {filters}
+      GROUP BY 1, 2
+      HAVING COUNT(*) >= 5
+      ORDER BY 1, 2
+
+  enps:
+    label: eNPS
+    domain: Employee Experience
+    definition: >
+      Employee Net Promoter Score. Percentage of promoters (9-10) minus
+      percentage of detractors (0-6) on the recommendation question. Range
+      is -100 to +100.
+    formula: "%promoters - %detractors"
+    source_system: Engagement Platform
+    source_objects: [v_survey]
+    grain: survey response
+    unit: index
+    format: "{:+.0f}"
+    direction: higher_is_better
+    owner: Employee Listening
+    refresh: Quarterly, on survey close
+    caveats:
+      - Highly sensitive to small sample sizes; check the response count.
+    dimensions: [business_unit, department, job_level, tenure_band]
+    sql: |
+      SELECT {dimension} AS dimension,
+             ROUND(100.0 * (COUNT(*) FILTER (WHERE enps_score >= 9)
+                          - COUNT(*) FILTER (WHERE enps_score <= 6)) / NULLIF(COUNT(*), 0), 0) AS value,
+             COUNT(*) AS responses
+      FROM v_survey
+      WHERE survey_period = (SELECT MAX(survey_period) FROM v_survey) {filters}
+      GROUP BY 1
+      HAVING COUNT(*) >= 5
+      ORDER BY value ASC
+
+  feedback_themes:
+    label: Feedback Themes
+    domain: Employee Experience
+    definition: >
+      Volume and sentiment split of open-text survey comments by theme. Themes
+      are assigned by the listening platform's classifier at ingestion, not by
+      the AI agent at query time, so theme assignment is stable and auditable.
+    formula: "COUNT(comments) by theme, split by sentiment"
+    source_system: Engagement Platform
+    source_objects: [v_survey]
+    grain: survey response
+    unit: count
+    format: "{:,.0f}"
+    direction: context
+    owner: Employee Listening
+    refresh: Quarterly, on survey close
+    caveats:
+      - One theme per comment; multi-topic comments are assigned their dominant theme.
+      - Comments are shown in aggregate only, never attributed.
+    dimensions: [business_unit, department, job_level, tenure_band]
+    sql: |
+      SELECT theme AS dimension,
+             COUNT(*) AS value,
+             COUNT(*) FILTER (WHERE sentiment = 'Negative') AS negative,
+             COUNT(*) FILTER (WHERE sentiment = 'Positive') AS positive,
+             ROUND(100.0 * COUNT(*) FILTER (WHERE sentiment = 'Negative') / NULLIF(COUNT(*), 0), 1) AS negative_pct,
+             ROUND(AVG(engagement_score), 2) AS avg_engagement
+      FROM v_survey
+      WHERE survey_period = (SELECT MAX(survey_period) FROM v_survey) {filters}
+      GROUP BY 1
+      HAVING COUNT(*) >= 5
+      ORDER BY value DESC
+
+  theme_engagement_link:
+    label: Theme to Engagement Link
+    domain: Employee Experience
+    definition: >
+      Average engagement score of respondents whose comment was classified into
+      each theme, compared with the overall average. Identifies which themes
+      travel with lower engagement. This is an association, not a causal claim.
+    formula: "AVG(engagement) by theme minus overall AVG(engagement)"
+    source_system: Engagement Platform
+    source_objects: [v_survey]
+    grain: survey response
+    unit: score
+    format: "{:+.2f}"
+    direction: higher_is_better
+    owner: Employee Listening
+    refresh: Quarterly, on survey close
+    caveats:
+      - Association only. Respondents who are already disengaged may be more likely to comment at all.
+    dimensions: [business_unit, department, job_level, tenure_band]
+    sql: |
+      WITH latest AS (SELECT MAX(survey_period) AS p FROM v_survey),
+      overall AS (SELECT AVG(engagement_score) AS avg_all FROM v_survey, latest WHERE survey_period = latest.p)
+      SELECT theme AS dimension,
+             ROUND(AVG(engagement_score) - (SELECT avg_all FROM overall), 2) AS value,
+             ROUND(AVG(engagement_score), 2) AS theme_engagement,
+             COUNT(*) AS responses
+      FROM v_survey, latest
+      WHERE survey_period = latest.p {filters}
+      GROUP BY 1
+      HAVING COUNT(*) >= 5
+      ORDER BY value ASC

@@ -1,0 +1,184 @@
+{
+  "name": "People Intelligence - Daily Brief",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Weekdays 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-460, 300]
+    },
+    {
+      "parameters": {
+        "command": "cd /opt/people-intelligence && python data/generate_data.py --refresh || true"
+      },
+      "id": "refresh-warehouse",
+      "name": "Refresh warehouse",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [-240, 300],
+      "notes": "In a real deployment this step is the HRIS/ATS extract-load, not a synthetic data regeneration."
+    },
+    {
+      "parameters": {
+        "command": "cd /opt/people-intelligence && python -c \"from pi.quality import checks; import json,sys; s=checks.scorecard(); print(json.dumps({'completeness': s['completeness_pct'], 'hard_failures': s['hard_failures']}))\""
+      },
+      "id": "quality-gate",
+      "name": "Data quality gate",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [-20, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "completeness-threshold",
+              "leftValue": "={{ JSON.parse($json.stdout).completeness }}",
+              "rightValue": 97,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-quality-ok",
+      "name": "Completeness >= 97%?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [200, 300],
+      "notes": "Refuse to publish a brief on data that failed the quality gate. A wrong brief is worse than no brief."
+    },
+    {
+      "parameters": {
+        "command": "cd /opt/people-intelligence && python automation/run_daily_brief.py --format json --min-severity medium"
+      },
+      "id": "generate-brief",
+      "name": "Detect signals & build brief",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [440, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-signals",
+              "leftValue": "={{ JSON.parse($json.stdout).signal_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-signals",
+      "name": "Any signals?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [660, 200],
+      "notes": "No signals means no message. An automation that pings every morning regardless gets muted within a fortnight."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ blocks: [ { type: 'header', text: { type: 'plain_text', text: 'People Intelligence Daily Brief' } }, { type: 'section', text: { type: 'mrkdwn', text: '*' + JSON.parse($json.stdout).headline + '*' } }, ...JSON.parse($json.stdout).signals.map(s => ({ type: 'section', text: { type: 'mrkdwn', text: '*' + s.headline + '*\\n_Why it matters._ ' + s.why_it_matters + '\\n_Recommended action._ ' + s.recommended_action } })) ] }) }}"
+      },
+      "id": "post-slack",
+      "name": "Post to People Leadership channel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 120]
+    },
+    {
+      "parameters": {
+        "command": "=cd /opt/people-intelligence && echo '{{ $json.stdout }}' > data/briefs/latest.json"
+      },
+      "id": "store-brief",
+      "name": "Store brief for the app",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [900, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ALERT_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: ':warning: People Intelligence brief suppressed - data quality below the 97% gate. Completeness: ' + JSON.parse($json.stdout).completeness + '%. Investigate the ingestion before the next run.' }) }}"
+      },
+      "id": "alert-quality",
+      "name": "Alert data owner",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 420]
+    }
+  ],
+  "connections": {
+    "Weekdays 06:00": {
+      "main": [[{ "node": "Refresh warehouse", "type": "main", "index": 0 }]]
+    },
+    "Refresh warehouse": {
+      "main": [[{ "node": "Data quality gate", "type": "main", "index": 0 }]]
+    },
+    "Data quality gate": {
+      "main": [[{ "node": "Completeness >= 97%?", "type": "main", "index": 0 }]]
+    },
+    "Completeness >= 97%?": {
+      "main": [
+        [{ "node": "Detect signals & build brief", "type": "main", "index": 0 }],
+        [{ "node": "Alert data owner", "type": "main", "index": 0 }]
+      ]
+    },
+    "Detect signals & build brief": {
+      "main": [[{ "node": "Any signals?", "type": "main", "index": 0 }]]
+    },
+    "Any signals?": {
+      "main": [
+        [
+          { "node": "Post to People Leadership channel", "type": "main", "index": 0 },
+          { "node": "Store brief for the app", "type": "main", "index": 0 }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "timezone": "America/New_York"
+  },
+  "tags": [
+    { "name": "people-analytics" },
+    { "name": "daily-brief" }
+  ]
+}

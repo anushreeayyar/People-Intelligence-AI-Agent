@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1-5"     # the same cadence as the Daily Brief
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Build the synthetic warehouse
+        run: python data/generate_data.py
+      - name: Data quality gate
+        run: |
+          python - <<'PY'
+          from pi.quality import checks
+          s = checks.scorecard()
+          print(checks.banner())
+          assert s["completeness_pct"] >= 97, "data quality below the publication gate"
+          PY
+      - name: Test suite
+        run: python -m pytest -q
+      - name: Daily brief smoke run
+        run: python automation/run_daily_brief.py --format md --no-save
